@@ -1,13 +1,14 @@
 {
     "mcpServers": {
         "telegram-mcp": {
-            "command": "/PATH-TO/uv",
+            "command": "/PATH-TO/telegram-mcp/.venv/bin/python",
             "args": [
-                "--directory",
-                "/PATH-TO/telegram-mcp",
-                "run",
-                "main.py"
-            ]
+                "-m",
+                "telegram_mcp_server.server"
+            ],
+            "env": {
+                "PYTHONPATH": "/PATH-TO/telegram-mcp"
+            }
         }
     }
 }

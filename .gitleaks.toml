@@ -1,0 +1,19 @@
+# .gitleaks.toml
+# Gitleaks configuration file for MidLibrary API
+# https://github.com/gitleaks/gitleaks
+
+title = "MidLibrary API Gitleaks Configuration"
+
+# Allowlist for false positives
+[allowlist]
+description = "Allowlist for known false positives"
+
+# Allow lines with gitleaks:allow comment
+regexes = [
+    '''gitleaks:allow''',
+]
+
+# Documentation examples with placeholder tokens
+paths = [
+    '''docs/.*\.md$''',
+]

@@ -17,4 +17,16 @@ services:
     # Replace './telegram_sessions' with your desired host path.
     # volumes:
     #   - ./telegram_sessions:/app
-    restart: unless-stopped 
+    restart: unless-stopped
+
+  telegram-mcp-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: telegram-mcp-api
+    env_file:
+      - .env
+    command: ["python", "-m", "telegram_mcp_server.api"]
+    ports:
+      - "8001:8000"
+    restart: unless-stopped

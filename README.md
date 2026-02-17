@@ -63,8 +63,8 @@ This MCP server exposes a huge suite of Telegram tools. **Every major Telegram/T
 
 ### Messaging
 - **get_messages(chat_id, page, page_size)**: Paginated messages
-- **list_messages(chat_id, limit, search_query, from_date, to_date)**: Filtered messages
-- **list_topics(chat_id, limit, offset_topic, search_query)**: List forum topics in supergroups
+- **list_messages(chat_id, limit, search_query, from_date, to_date, topic_id)**: Filtered messages (supports forum topic filtering)
+- **list_topics(chat_id, limit, offset_topic, search_query)**: List forum topics in supergroups (IDs can be used for filtering messages)
 - **send_message(chat_id, message)**: Send a message
 - **reply_to_message(chat_id, message_id, text)**: Reply to a message
 - **edit_message(chat_id, message_id, new_text)**: Edit your message
@@ -74,7 +74,7 @@ This MCP server exposes a huge suite of Telegram tools. **Every major Telegram/T
 - **unpin_message(chat_id, message_id)**: Unpin a message
 - **mark_as_read(chat_id)**: Mark all as read
 - **get_message_context(chat_id, message_id, context_size)**: Context around a message
-- **get_history(chat_id, limit)**: Full chat history
+- **get_history(chat_id, limit, topic_id)**: Full chat history (supports forum topic filtering)
 - **get_pinned_messages(chat_id)**: List pinned messages
 - **get_last_interaction(contact_id)**: Most recent message with a contact
 - **create_poll(chat_id, question, options, multiple_choice, quiz_mode, public_votes, close_date)**: Create a poll
@@ -144,7 +144,7 @@ The server will automatically validate the input and convert it to the correct f
 
 ## Removed Functionality
 
-Please note that tools requiring direct file path access on the server (`send_file`, `download_media`, `set_profile_photo`, `edit_chat_photo`, `send_voice`, `send_sticker`, `upload_file`) have been removed from `main.py`. This is due to limitations in the current MCP environment regarding handling file attachments and local file system paths.
+Please note that tools requiring direct file path access on the server (`send_file`, `download_media`, `set_profile_photo`, `edit_chat_photo`, `send_voice`, `send_sticker`, `upload_file`) have been removed from `telegram_mcp_server/server.py`. This is due to limitations in the current MCP environment regarding handling file attachments and local file system paths.
 
 Additionally, GIF-related tools (`get_gif_search`, `get_saved_gifs`, `send_gif`) have been removed due to ongoing issues with reliability in the Telethon library or Telegram API interactions.
 
@@ -176,7 +176,7 @@ uv sync
 ### 3. Generate a Session String
 
 ```bash
-uv run session_string_generator.py
+uv run -m telegram_mcp_server.session_string_generator
 ```
 Follow the prompts to authenticate and update your `.env` file.
 
@@ -253,12 +253,34 @@ Edit your Claude desktop config (e.g. `~/Library/Application Support/Claude/clau
         "--directory",
         "/full/path/to/telegram-mcp",
         "run",
-        "main.py"
+        "-m",
+        "telegram_mcp_server.server"
       ]
     }
   }
 }
 ```
+
+## 🌐 REST API
+
+You can run the REST API wrapper to call MCP tools over HTTP:
+
+```bash
+telegram-mcp-api
+```
+
+Default host/port are `0.0.0.0:8000`. Override with:
+
+```bash
+export TELEGRAM_MCP_API_HOST=127.0.0.1
+export TELEGRAM_MCP_API_PORT=8000
+```
+
+Endpoints:
+
+- `GET /health`
+- `GET /tools`
+- `POST /tools/{tool_name}` with JSON body `{ "args": { ... } }`
 
 ## 📝 Tool Examples with Code & Output
 
@@ -409,7 +431,7 @@ async def get_invite_link(chat_id: int) -> str:
     """
     try:
         entity = await client.get_entity(chat_id)
-        
+
         # Try using ExportChatInviteRequest first
         try:
             from telethon.tl import functions
@@ -423,14 +445,14 @@ async def get_invite_link(chat_id: int) -> str:
         except Exception as e1:
             # If that fails, log and try alternative approach
             logger.warning(f"ExportChatInviteRequest failed: {e1}")
-            
+
         # Alternative approach using client.export_chat_invite_link
         try:
             invite_link = await client.export_chat_invite_link(entity)
             return invite_link
         except Exception as e2:
             logger.warning(f"export_chat_invite_link failed: {e2}")
-            
+
         # Last resort: Try directly fetching chat info
         try:
             if isinstance(entity, (Chat, Channel)):
@@ -441,7 +463,7 @@ async def get_invite_link(chat_id: int) -> str:
                     return full_chat.full_chat.invite_link or "No invite link available."
         except Exception as e3:
             logger.warning(f"GetFullChatRequest failed: {e3}")
-            
+
         return "Could not retrieve invite link for this chat."
     except Exception as e:
         logger.exception(f"get_invite_link failed (chat_id={chat_id})")
@@ -469,7 +491,7 @@ async def join_chat_by_link(link: str) -> str:
                 hash_part = hash_part[1:]  # Remove the '+' if present
         else:
             hash_part = link
-            
+
         # Try checking the invite before joining
         try:
             # Try to check invite info first (will often fail if not a member)
@@ -481,7 +503,7 @@ async def join_chat_by_link(link: str) -> str:
         except Exception:
             # This often fails if not a member - just continue
             pass
-            
+
         # Join the chat using the hash
         result = await client(functions.messages.ImportChatInviteRequest(hash=hash_part))
         if result and hasattr(result, 'chats') and result.chats:
@@ -545,7 +567,7 @@ Example output:
 async def get_direct_chat_by_contact(contact_query: str) -> str:
     """
     Find a direct chat with a specific contact by name, username, or phone.
-    
+
     Args:
         contact_query: Name, username, or phone number to search for.
     """
@@ -560,8 +582,8 @@ async def get_direct_chat_by_contact(contact_query: str) -> str:
             name = f"{getattr(contact, 'first_name', '')} {getattr(contact, 'last_name', '')}".strip()
             username = getattr(contact, 'username', '')
             phone = getattr(contact, 'phone', '')
-            if (contact_query.lower() in name.lower() or 
-                (username and contact_query.lower() in username.lower()) or 
+            if (contact_query.lower() in name.lower() or
+                (username and contact_query.lower() in username.lower()) or
                 (phone and contact_query in phone)):
                 found_contacts.append(contact)
         if not found_contacts:
@@ -580,10 +602,10 @@ async def get_direct_chat_by_contact(contact_query: str) -> str:
                         chat_info += f", Unread: {dialog.unread_count}"
                     results.append(chat_info)
                     break
-        
+
         if not results:
             return f"Found contacts matching '{contact_query}', but no direct chats with them."
-        
+
         return "\n".join(results)
     except Exception as e:
         return f"Error searching for direct chat: {e}"

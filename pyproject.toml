@@ -24,24 +24,28 @@ classifiers = [
 requires-python = ">=3.10"
 dependencies = [
     "dotenv>=0.9.9",
+    "fastapi>=0.115.0",
     "httpx>=0.28.1",
     "mcp[cli]>=1.8.0",
     "nest-asyncio>=1.6.0",
     "python-dotenv>=1.1.0",
     "python-json-logger>=3.3.0",
-    "telethon>=1.39.0"
+    "telethon>=1.39.0",
+    "uvicorn>=0.30.0"
 ]
 
 [project.urls]
 "Homepage" = "https://github.com/chigwell/telegram-mcp"
 "Bug Tracker" = "https://github.com/chigwell/telegram-mcp/issues"
 
-[tool.setuptools]
-py-modules = ["main", "session_string_generator"]
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["telegram_mcp_server"]
 
 [project.scripts]
-telegram-mcp = "main:main"
-telegram-mcp-generate-session = "session_string_generator:main"
+telegram-mcp = "telegram_mcp_server.server:main"
+telegram-mcp-generate-session = "telegram_mcp_server.session_string_generator:main"
+telegram-mcp-api = "telegram_mcp_server.api:main"
 
 [tool.black]
 line-length = 99

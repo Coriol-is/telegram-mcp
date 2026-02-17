@@ -23,8 +23,7 @@ RUN pip install --no-cache-dir --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the rest of the application code
-COPY main.py .
-# COPY session_string_generator.py . # Optional: if needed within the container, otherwise can be run outside
+COPY telegram_mcp_server/ telegram_mcp_server/
 
 # Create a non-root user and switch to it
 RUN adduser --disabled-password --gecos "" appuser && chown -R appuser:appuser /app
@@ -40,8 +39,8 @@ ENV TELEGRAM_SESSION_NAME="telegram_mcp_session"
 # Or provide the session string directly
 ENV TELEGRAM_SESSION_STRING=""
 
-# Expose any ports if the application were a web server (not needed for stdio MCP)
-# EXPOSE 8000
+# Expose REST API port when running telegram_mcp_server.api
+EXPOSE 8000
 
 # Define the command to run the application
-CMD ["python", "main.py"] 
+CMD ["python", "-m", "telegram_mcp_server.server"]

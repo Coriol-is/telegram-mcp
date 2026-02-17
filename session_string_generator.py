@@ -20,10 +20,11 @@ and usernames (e.g., "@mychannel").
 """
 
 import os
-from telethon.sync import TelegramClient
-from telethon.sessions import StringSession
-from dotenv import load_dotenv
 import sys
+
+from dotenv import load_dotenv
+from telethon.sessions import StringSession
+from telethon.sync import TelegramClient
 
 # Load environment variables from .env file
 load_dotenv()

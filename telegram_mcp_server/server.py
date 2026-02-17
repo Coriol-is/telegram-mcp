@@ -1,44 +1,37 @@
-import os
-import sys
-import json
-import time
 import asyncio
-import sqlite3
-import logging
+import json
 import mimetypes
-from datetime import datetime, timedelta
+import os
+import re
+import sqlite3
+import sys
+from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import List, Dict, Optional, Union, Any
+from functools import wraps
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 # Third-party libraries
 import nest_asyncio
-from dotenv import load_dotenv
+import telethon.errors.rpcerrorlist
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
-from pythonjsonlogger import jsonlogger
-from telethon import TelegramClient, functions, types, utils
-from telethon.sessions import StringSession
+from telethon import functions, types, utils
 from telethon.tl.types import (
-    User,
-    Chat,
     Channel,
+    ChannelParticipantsAdmins,
+    ChannelParticipantsKicked,
+    Chat,
     ChatAdminRights,
     ChatBannedRights,
-    ChannelParticipantsKicked,
-    ChannelParticipantsAdmins,
-    InputChatPhoto,
-    InputChatUploadedPhoto,
-    InputChatPhotoEmpty,
-    InputPeerUser,
-    InputPeerChat,
-    InputPeerChannel,
     DialogFilter,
     DialogFilterDefault,
+    InputChatPhotoEmpty,
+    InputChatUploadedPhoto,
     TextWithEntities,
+    User,
 )
-import re
-from functools import wraps
-import telethon.errors.rpcerrorlist
+
+from .client import client, logger, start_client
 
 
 class ValidationError(Exception):
@@ -82,61 +75,12 @@ def get_entity_filter_type(entity: Any) -> Optional[str]:
     return None
 
 
-load_dotenv()
-
-TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID"))
-TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
-TELEGRAM_SESSION_NAME = os.getenv("TELEGRAM_SESSION_NAME")
-
-# Check if a string session exists in environment, otherwise use file-based session
-SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING")
+UNKNOWN_CHAT_TITLE = "Unknown Chat"
+INT64_MIN = -(2**63)
+INT64_MAX = 2**63 - 1
+USERNAME_RE = re.compile(r"^@?\w{5,}$", re.ASCII)
 
 mcp = FastMCP("telegram")
-
-if SESSION_STRING:
-    # Use the string session if available
-    client = TelegramClient(StringSession(SESSION_STRING), TELEGRAM_API_ID, TELEGRAM_API_HASH)
-else:
-    # Use file-based session
-    client = TelegramClient(TELEGRAM_SESSION_NAME, TELEGRAM_API_ID, TELEGRAM_API_HASH)
-
-# Setup robust logging with both file and console output
-logger = logging.getLogger("telegram_mcp")
-logger.setLevel(logging.ERROR)  # Set to ERROR for production, INFO for debugging
-
-# Create console handler
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.ERROR)  # Set to ERROR for production, INFO for debugging
-
-# Create file handler with absolute path
-script_dir = os.path.dirname(os.path.abspath(__file__))
-log_file_path = os.path.join(script_dir, "mcp_errors.log")
-
-try:
-    file_handler = logging.FileHandler(log_file_path, mode="a")  # Append mode
-    file_handler.setLevel(logging.ERROR)
-
-    # Create formatters
-    # Console formatter remains in the old format
-    console_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s - %(message)s")
-    console_handler.setFormatter(console_formatter)
-
-    # File formatter is now JSON
-    json_formatter = jsonlogger.JsonFormatter(
-        "%(asctime)s %(name)s %(levelname)s %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S%z",
-    )
-    file_handler.setFormatter(json_formatter)
-
-    # Add handlers to logger
-    logger.addHandler(console_handler)
-    logger.addHandler(file_handler)
-    logger.info(f"Logging initialized to {log_file_path}")
-except Exception as log_error:
-    print(f"WARNING: Error setting up log file: {log_error}")
-    # Fallback to console-only logging
-    logger.addHandler(console_handler)
-    logger.error(f"Failed to set up log file handler: {log_error}")
 
 
 # Error code prefix mapping for better error tracing
@@ -152,11 +96,28 @@ class ErrorCategory(str, Enum):
     FOLDER = "FOLDER"
 
 
+def _generate_error_code(
+    function_name: str, prefix: Optional[Union[ErrorCategory, str]] = None
+) -> str:
+    """Generate a consistent error code."""
+    if isinstance(prefix, str) and prefix == "VALIDATION-001":
+        return prefix
+
+    if prefix is None:
+        for category in ErrorCategory:
+            if category.name.lower() in function_name.lower():
+                prefix = category
+                break
+
+    prefix_str = prefix.value if isinstance(prefix, ErrorCategory) else (prefix or "GEN")
+    return f"{prefix_str}-ERR-{abs(hash(function_name)) % 1000:03d}"
+
+
 def log_and_format_error(
     function_name: str,
     error: Exception,
     prefix: Optional[Union[ErrorCategory, str]] = None,
-    user_message: str = None,
+    user_message: Optional[str] = None,
     **kwargs,
 ) -> str:
     """
@@ -175,22 +136,7 @@ def log_and_format_error(
     Returns:
         A user-friendly error message with an error code.
     """
-    # Generate a consistent error code
-    if isinstance(prefix, str) and prefix == "VALIDATION-001":
-        # Special case for validation errors
-        error_code = prefix
-    else:
-        if prefix is None:
-            # Try to derive prefix from function name
-            for category in ErrorCategory:
-                if category.name.lower() in function_name.lower():
-                    prefix = category
-                    break
-
-        prefix_str = prefix.value if isinstance(prefix, ErrorCategory) else (prefix or "GEN")
-        error_code = f"{prefix_str}-ERR-{abs(hash(function_name)) % 1000:03d}"
-
-    # Format the additional context parameters
+    error_code = _generate_error_code(function_name, prefix)
     context = ", ".join(f"{k}={v}" for k, v in kwargs.items())
 
     # Log the full technical error
@@ -201,6 +147,88 @@ def log_and_format_error(
         return user_message
 
     return f"An error occurred (code: {error_code}). Check mcp_errors.log for details."
+
+
+def _normalize_messages(messages: Any) -> List[Any]:
+    if messages is None:
+        return []
+    if isinstance(messages, list):
+        return messages
+    return [messages]
+
+
+def _normalize_entity(entity: Any) -> Any:
+    if isinstance(entity, list):
+        return entity[0] if entity else None
+    return entity
+
+
+def _parse_optional_int(
+    value: Optional[Union[int, str]], field_name: str
+) -> Tuple[Optional[int], Optional[str]]:
+    if value is None:
+        return None, None
+    if isinstance(value, int):
+        return value, None
+    if isinstance(value, str) and value.isdigit():
+        return int(value), None
+    return None, f"{field_name} must be an integer."
+
+
+def _parse_date_yyyy_mm_dd(
+    value: Optional[str], field_name: str, end_of_day: bool = False
+) -> Tuple[Optional[datetime], Optional[str]]:
+    if not value:
+        return None, None
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        return None, f"Invalid {field_name} format. Use YYYY-MM-DD."
+
+    if end_of_day:
+        parsed = parsed + timedelta(days=1, microseconds=-1)
+
+    return parsed.replace(tzinfo=timezone.utc), None
+
+
+def _validate_single_id(
+    value: Any, param_name: str
+) -> Tuple[Optional[Union[int, str]], Optional[str]]:
+    if isinstance(value, int):
+        if not (INT64_MIN <= value <= INT64_MAX):
+            return None, f"Invalid {param_name}: {value}. ID is out of the valid integer range."
+        return value, None
+
+    if isinstance(value, str):
+        try:
+            int_value = int(value)
+        except ValueError:
+            if USERNAME_RE.match(value):
+                return value, None
+            return (
+                None,
+                f"Invalid {param_name}: '{value}'. Must be a valid integer ID, or a username string.",
+            )
+        if not (INT64_MIN <= int_value <= INT64_MAX):
+            return None, f"Invalid {param_name}: {value}. ID is out of the valid integer range."
+        return int_value, None
+
+    return None, f"Invalid {param_name}: {value}. Type must be an integer or a string."
+
+
+def _validate_param_value(
+    param_name: str, param_value: Any
+) -> Tuple[Optional[Union[int, str, List[Union[int, str]]]], Optional[str]]:
+    if isinstance(param_value, list):
+        validated_list = []
+        for item in param_value:
+            validated_item, error_msg = _validate_single_id(item, param_name)
+            if error_msg:
+                return None, error_msg
+            validated_list.append(validated_item)
+        return validated_list, None
+
+    return _validate_single_id(param_value, param_name)
 
 
 def validate_id(*param_names_to_validate):
@@ -218,67 +246,16 @@ def validate_id(*param_names_to_validate):
                     continue
 
                 param_value = kwargs[param_name]
-
-                def validate_single_id(value, p_name):
-                    # Handle integer IDs
-                    if isinstance(value, int):
-                        if not (-(2**63) <= value <= 2**63 - 1):
-                            return (
-                                None,
-                                f"Invalid {p_name}: {value}. ID is out of the valid integer range.",
-                            )
-                        return value, None
-
-                    # Handle string IDs
-                    if isinstance(value, str):
-                        try:
-                            int_value = int(value)
-                            if not (-(2**63) <= int_value <= 2**63 - 1):
-                                return (
-                                    None,
-                                    f"Invalid {p_name}: {value}. ID is out of the valid integer range.",
-                                )
-                            return int_value, None
-                        except ValueError:
-                            if re.match(r"^@?[a-zA-Z0-9_]{5,}$", value):
-                                return value, None
-                            else:
-                                return (
-                                    None,
-                                    f"Invalid {p_name}: '{value}'. Must be a valid integer ID, or a username string.",
-                                )
-
-                    # Handle other invalid types
-                    return (
-                        None,
-                        f"Invalid {p_name}: {value}. Type must be an integer or a string.",
+                validated_value, error_msg = _validate_param_value(param_name, param_value)
+                if error_msg:
+                    return log_and_format_error(
+                        func.__name__,
+                        ValidationError(error_msg),
+                        prefix="VALIDATION-001",
+                        user_message=error_msg,
+                        **{param_name: param_value},
                     )
-
-                if isinstance(param_value, list):
-                    validated_list = []
-                    for item in param_value:
-                        validated_item, error_msg = validate_single_id(item, param_name)
-                        if error_msg:
-                            return log_and_format_error(
-                                func.__name__,
-                                ValidationError(error_msg),
-                                prefix="VALIDATION-001",
-                                user_message=error_msg,
-                                **{param_name: param_value},
-                            )
-                        validated_list.append(validated_item)
-                    kwargs[param_name] = validated_list
-                else:
-                    validated_value, error_msg = validate_single_id(param_value, param_name)
-                    if error_msg:
-                        return log_and_format_error(
-                            func.__name__,
-                            ValidationError(error_msg),
-                            prefix="VALIDATION-001",
-                            user_message=error_msg,
-                            **{param_name: param_value},
-                        )
-                    kwargs[param_name] = validated_value
+                kwargs[param_name] = validated_value
 
             return await func(*args, **kwargs)
 
@@ -400,9 +377,13 @@ async def get_messages(chat_id: Union[int, str], page: int = 1, page_size: int =
         page_size: Number of messages per page.
     """
     try:
-        entity = await client.get_entity(chat_id)
+        entity = _normalize_entity(await client.get_entity(chat_id))
+        if not entity:
+            return f"Chat {chat_id} not found."
         offset = (page - 1) * page_size
-        messages = await client.get_messages(entity, limit=page_size, add_offset=offset)
+        messages = _normalize_messages(
+            await client.get_messages(entity, limit=page_size, add_offset=offset)
+        )
         if not messages:
             return "No messages found for this page."
         lines = []
@@ -436,7 +417,9 @@ async def send_message(chat_id: Union[int, str], message: str) -> str:
         message: The message content to send.
     """
     try:
-        entity = await client.get_entity(chat_id)
+        entity = _normalize_entity(await client.get_entity(chat_id))
+        if not entity:
+            return f"Chat {chat_id} not found."
         await client.send_message(entity, message)
         return "Message sent successfully."
     except Exception as e:
@@ -457,8 +440,11 @@ async def subscribe_public_channel(channel: Union[int, str]) -> str:
     Subscribe (join) to a public channel or supergroup by username or ID.
     """
     try:
-        entity = await client.get_entity(channel)
-        await client(functions.channels.JoinChannelRequest(channel=entity))
+        entity = _normalize_entity(await client.get_entity(channel))
+        if not entity:
+            return f"Channel {channel} not found."
+        input_channel = utils.get_input_channel(entity)
+        await client(functions.channels.JoinChannelRequest(channel=input_channel))
         title = getattr(entity, "title", getattr(entity, "username", "Unknown channel"))
         return f"Subscribed to {title}."
     except telethon.errors.rpcerrorlist.UserAlreadyParticipantError:
@@ -468,6 +454,89 @@ async def subscribe_public_channel(channel: Union[int, str]) -> str:
         return "Cannot subscribe: this channel is private or requires an invite link."
     except Exception as e:
         return log_and_format_error("subscribe_public_channel", e, channel=channel)
+
+
+def _format_button_line(idx: int, btn) -> str:
+    """Helper function to format a single button line."""
+    raw_button = getattr(btn, "button", None)
+    text = getattr(btn, "text", "") or "<no text>"
+    url = getattr(raw_button, "url", None) if raw_button else None
+    has_callback = bool(getattr(btn, "data", None))
+    parts = [f"[{idx}] text='{text}'"]
+    parts.append("callback=yes" if has_callback else "callback=no")
+    if url:
+        parts.append(f"url={url}")
+    return ", ".join(parts)
+
+
+def _flatten_buttons(buttons_attr: Any) -> List[Any]:
+    return [btn for row in buttons_attr for btn in row]
+
+
+def _select_button(
+    buttons: List[Any],
+    button_text: Optional[str],
+    button_index: Optional[int],
+) -> Tuple[Optional[Any], Optional[str]]:
+    if button_text:
+        normalized = button_text.strip().lower()
+        for btn in buttons:
+            if (getattr(btn, "text", "") or "").strip().lower() == normalized:
+                return btn, None
+
+    if button_index is not None:
+        if button_index < 0 or button_index >= len(buttons):
+            return None, f"button_index out of range. Valid indices: 0-{len(buttons) - 1}."
+        return buttons[button_index], None
+
+    return None, "Button not found."
+
+
+def _format_callback_response(callback_result: Any) -> str:
+    response_parts = []
+    if getattr(callback_result, "message", None):
+        response_parts.append(callback_result.message)
+    if getattr(callback_result, "alert", None):
+        response_parts.append("Telegram displayed an alert to the user.")
+    if not response_parts:
+        response_parts.append("Button pressed successfully.")
+    return " ".join(response_parts)
+
+
+def _extract_buttons(target_message: Any) -> Tuple[Optional[List[Any]], Optional[str]]:
+    buttons_attr = getattr(target_message, "buttons", None)
+    if not buttons_attr:
+        return None, f"Message {target_message.id} does not contain inline buttons."
+
+    buttons = _flatten_buttons(buttons_attr)
+    if not buttons:
+        return None, f"Message {target_message.id} does not contain inline buttons."
+
+    return buttons, None
+
+
+def _handle_non_callback_button(target_button: Any) -> Optional[str]:
+    if getattr(target_button, "data", None):
+        return None
+
+    raw_button = getattr(target_button, "button", None)
+    url = getattr(raw_button, "url", None) if raw_button else None
+    if url:
+        return f"Selected button opens a URL instead of sending a callback: {url}"
+    return "Selected button does not provide callback data to press."
+
+
+async def _get_target_message(entity, message_id: Optional[int], limit: int):
+    """Helper function to get the target message with buttons."""
+    if message_id is not None:
+        target_message = await client.get_messages(entity, ids=message_id)
+        target_message = _normalize_entity(target_message)
+        return target_message
+
+    recent_messages = _normalize_messages(await client.get_messages(entity, limit=limit))
+    if not recent_messages:
+        return None
+    return next((msg for msg in recent_messages if getattr(msg, "buttons", None)), None)
 
 
 @mcp.tool(
@@ -482,23 +551,12 @@ async def list_inline_buttons(
     """
     try:
         if isinstance(message_id, str):
-            if message_id.isdigit():
-                message_id = int(message_id)
-            else:
+            message_id = int(message_id) if message_id.isdigit() else None
+            if isinstance(message_id, str):
                 return "message_id must be an integer."
 
         entity = await client.get_entity(chat_id)
-        target_message = None
-
-        if message_id is not None:
-            target_message = await client.get_messages(entity, ids=message_id)
-            if isinstance(target_message, list):
-                target_message = target_message[0] if target_message else None
-        else:
-            recent_messages = await client.get_messages(entity, limit=limit)
-            target_message = next(
-                (msg for msg in recent_messages if getattr(msg, "buttons", None)), None
-            )
+        target_message = await _get_target_message(entity, message_id, limit)
 
         if not target_message:
             return "No message with inline buttons found."
@@ -511,19 +569,8 @@ async def list_inline_buttons(
         if not buttons:
             return f"Message {target_message.id} does not contain inline buttons."
 
-        lines = [
-            f"Buttons for message {target_message.id} (date {target_message.date}):",
-        ]
-        for idx, btn in enumerate(buttons):
-            raw_button = getattr(btn, "button", None)
-            text = getattr(btn, "text", "") or "<no text>"
-            url = getattr(raw_button, "url", None) if raw_button else None
-            has_callback = bool(getattr(btn, "data", None))
-            parts = [f"[{idx}] text='{text}'"]
-            parts.append("callback=yes" if has_callback else "callback=no")
-            if url:
-                parts.append(f"url={url}")
-            lines.append(", ".join(parts))
+        lines = [f"Buttons for message {target_message.id} (date {target_message.date}):"]
+        lines.extend(_format_button_line(idx, btn) for idx, btn in enumerate(buttons))
 
         return "\n".join(lines)
     except Exception as e:
@@ -561,60 +608,30 @@ async def press_inline_button(
         if button_text is None and button_index is None:
             return "Provide button_text or button_index to choose a button."
 
-        # Normalize message_id if provided as a string
-        if isinstance(message_id, str):
-            if message_id.isdigit():
-                message_id = int(message_id)
-            else:
-                return "message_id must be an integer."
+        message_id, message_error = _parse_optional_int(message_id, "message_id")
+        if message_error:
+            return message_error
 
-        if isinstance(button_index, str):
-            if button_index.isdigit():
-                button_index = int(button_index)
-            else:
-                return "button_index must be an integer."
+        button_index, index_error = _parse_optional_int(button_index, "button_index")
+        if index_error:
+            return index_error
 
-        entity = await client.get_entity(chat_id)
+        entity = _normalize_entity(await client.get_entity(chat_id))
+        if not entity:
+            return f"Chat {chat_id} not found."
 
-        target_message = None
-        if message_id is not None:
-            target_message = await client.get_messages(entity, ids=message_id)
-            if isinstance(target_message, list):
-                target_message = target_message[0] if target_message else None
-        else:
-            recent_messages = await client.get_messages(entity, limit=20)
-            target_message = next(
-                (msg for msg in recent_messages if getattr(msg, "buttons", None)), None
-            )
+        target_message = await _get_target_message(entity, message_id, 20)
 
         if not target_message:
             return "No message with inline buttons found. Specify message_id to target a specific message."
 
-        buttons_attr = getattr(target_message, "buttons", None)
-        if not buttons_attr:
-            return f"Message {target_message.id} does not contain inline buttons."
+        buttons, buttons_error = _extract_buttons(target_message)
+        if buttons_error:
+            return buttons_error
 
-        buttons = [btn for row in buttons_attr for btn in row]
-        if not buttons:
-            return f"Message {target_message.id} does not contain inline buttons."
-
-        target_button = None
-        if button_text:
-            normalized = button_text.strip().lower()
-            target_button = next(
-                (
-                    btn
-                    for btn in buttons
-                    if (getattr(btn, "text", "") or "").strip().lower() == normalized
-                ),
-                None,
-            )
-
-        if target_button is None and button_index is not None:
-            if button_index < 0 or button_index >= len(buttons):
-                return f"button_index out of range. Valid indices: 0-{len(buttons) - 1}."
-            target_button = buttons[button_index]
-
+        target_button, select_error = _select_button(buttons, button_text, button_index)
+        if select_error and select_error != "Button not found.":
+            return select_error
         if not target_button:
             available = ", ".join(
                 f"[{idx}] {getattr(btn, 'text', '') or '<no text>'}"
@@ -622,12 +639,9 @@ async def press_inline_button(
             )
             return f"Button not found. Available buttons: {available}"
 
-        if not getattr(target_button, "data", None):
-            raw_button = getattr(target_button, "button", None)
-            url = getattr(raw_button, "url", None) if raw_button else None
-            if url:
-                return f"Selected button opens a URL instead of sending a callback: {url}"
-            return "Selected button does not provide callback data to press."
+        non_callback_message = _handle_non_callback_button(target_button)
+        if non_callback_message:
+            return non_callback_message
 
         callback_result = await client(
             functions.messages.GetBotCallbackAnswerRequest(
@@ -635,15 +649,7 @@ async def press_inline_button(
             )
         )
 
-        response_parts = []
-        if getattr(callback_result, "message", None):
-            response_parts.append(callback_result.message)
-        if getattr(callback_result, "alert", None):
-            response_parts.append("Telegram displayed an alert to the user.")
-        if not response_parts:
-            response_parts.append("Button pressed successfully.")
-
-        return " ".join(response_parts)
+        return _format_callback_response(callback_result)
     except Exception as e:
         return log_and_format_error(
             "press_inline_button",
@@ -664,7 +670,7 @@ async def list_contacts() -> str:
     """
     try:
         result = await client(functions.contacts.GetContactsRequest(hash=0))
-        users = result.users
+        users = getattr(result, "users", [])
         if not users:
             return "No contacts found."
         lines = []
@@ -694,7 +700,7 @@ async def search_contacts(query: str) -> str:
     """
     try:
         result = await client(functions.contacts.SearchRequest(q=query, limit=50))
-        users = result.users
+        users = getattr(result, "users", [])
         if not users:
             return f"No contacts found matching '{query}'."
         lines = []
@@ -729,6 +735,109 @@ async def get_contact_ids() -> str:
         return log_and_format_error("get_contact_ids", e)
 
 
+async def _collect_messages_by_search(
+    entity: Any,
+    search_query: str,
+    from_date_obj: Optional[datetime],
+    to_date_obj: Optional[datetime],
+    limit: int,
+) -> List[Any]:
+    messages = []
+    async for msg in client.iter_messages(entity, search=search_query):
+        if to_date_obj and msg.date > to_date_obj:
+            continue
+        if from_date_obj and msg.date < from_date_obj:
+            break
+        messages.append(msg)
+        if len(messages) >= limit:
+            break
+    return messages
+
+
+async def _collect_messages_by_date(
+    entity: Any,
+    from_date_obj: Optional[datetime],
+    to_date_obj: Optional[datetime],
+    limit: int,
+) -> List[Any]:
+    if from_date_obj:
+        return await _collect_messages_from_date(entity, from_date_obj, to_date_obj, limit)
+    if to_date_obj:
+        return await _collect_messages_to_date(entity, to_date_obj, limit)
+    return []
+
+
+async def _collect_messages_from_date(
+    entity: Any,
+    from_date_obj: datetime,
+    to_date_obj: Optional[datetime],
+    limit: int,
+) -> List[Any]:
+    messages = []
+    async for msg in client.iter_messages(entity, offset_date=from_date_obj, reverse=True):
+        if to_date_obj and msg.date > to_date_obj:
+            break
+        if msg.date < from_date_obj:
+            continue
+        messages.append(msg)
+        if len(messages) >= limit:
+            break
+    return messages
+
+
+async def _collect_messages_to_date(
+    entity: Any,
+    to_date_obj: datetime,
+    limit: int,
+) -> List[Any]:
+    messages = []
+    async for msg in client.iter_messages(
+        entity, offset_date=to_date_obj + timedelta(microseconds=1)
+    ):
+        messages.append(msg)
+        if len(messages) >= limit:
+            break
+    return messages
+
+
+async def _fetch_messages_with_filters(
+    entity: Any,
+    limit: int,
+    search_query: Optional[str],
+    from_date_obj: Optional[datetime],
+    to_date_obj: Optional[datetime],
+    topic_id: Optional[int] = None,
+) -> List[Any]:
+    # Handle forum topic filtering
+    if topic_id is not None:
+        # Special case: General topic (ID=1) has no reply_to
+        if topic_id == 1:
+            # For General topic, we need to filter messages without reply_to
+            # This requires manual filtering as Telethon doesn't support this directly
+            all_messages = []
+            async for msg in client.iter_messages(entity, limit=limit * 2):
+                if not msg.reply_to or not getattr(msg.reply_to, "reply_to_top_id", None):
+                    all_messages.append(msg)
+                    if len(all_messages) >= limit:
+                        break
+            return all_messages
+        else:
+            # For other topics, use reply_to parameter
+            return _normalize_messages(
+                await client.get_messages(entity, limit=limit, reply_to=topic_id)
+            )
+
+    if search_query:
+        return await _collect_messages_by_search(
+            entity, search_query, from_date_obj, to_date_obj, limit
+        )
+
+    if from_date_obj or to_date_obj:
+        return await _collect_messages_by_date(entity, from_date_obj, to_date_obj, limit)
+
+    return _normalize_messages(await client.get_messages(entity, limit=limit))
+
+
 @mcp.tool(
     annotations=ToolAnnotations(title="List Messages", openWorldHint=True, readOnlyHint=True)
 )
@@ -736,9 +845,10 @@ async def get_contact_ids() -> str:
 async def list_messages(
     chat_id: Union[int, str],
     limit: int = 20,
-    search_query: str = None,
-    from_date: str = None,
-    to_date: str = None,
+    search_query: Optional[str] = None,
+    from_date: Optional[str] = None,
+    to_date: Optional[str] = None,
+    topic_id: Optional[int] = None,
 ) -> str:
     """
     Retrieve messages with optional filters.
@@ -749,96 +859,34 @@ async def list_messages(
         search_query: Filter messages containing this text.
         from_date: Filter messages starting from this date (format: YYYY-MM-DD).
         to_date: Filter messages until this date (format: YYYY-MM-DD).
+        topic_id: Filter messages by forum topic ID (use 1 for General topic).
     """
     try:
-        entity = await client.get_entity(chat_id)
+        entity = _normalize_entity(await client.get_entity(chat_id))
+        if not entity:
+            return f"Chat {chat_id} not found."
 
         # Parse date filters if provided
         from_date_obj = None
         to_date_obj = None
 
-        if from_date:
-            try:
-                from_date_obj = datetime.strptime(from_date, "%Y-%m-%d")
-                # Make it timezone aware by adding UTC timezone info
-                # Use datetime.timezone.utc for Python 3.9+ or import timezone directly for 3.13+
-                try:
-                    # For Python 3.9+
-                    from_date_obj = from_date_obj.replace(tzinfo=datetime.timezone.utc)
-                except AttributeError:
-                    # For Python 3.13+
-                    from datetime import timezone
+        from_date_obj, from_error = _parse_date_yyyy_mm_dd(from_date, "from_date")
+        if from_error:
+            return from_error
 
-                    from_date_obj = from_date_obj.replace(tzinfo=timezone.utc)
-            except ValueError:
-                return f"Invalid from_date format. Use YYYY-MM-DD."
+        to_date_obj, to_error = _parse_date_yyyy_mm_dd(to_date, "to_date", end_of_day=True)
+        if to_error:
+            return to_error
 
-        if to_date:
-            try:
-                to_date_obj = datetime.strptime(to_date, "%Y-%m-%d")
-                # Set to end of day and make timezone aware
-                to_date_obj = to_date_obj + timedelta(days=1, microseconds=-1)
-                # Add timezone info
-                try:
-                    to_date_obj = to_date_obj.replace(tzinfo=datetime.timezone.utc)
-                except AttributeError:
-                    from datetime import timezone
-
-                    to_date_obj = to_date_obj.replace(tzinfo=timezone.utc)
-            except ValueError:
-                return f"Invalid to_date format. Use YYYY-MM-DD."
-
-        # Prepare filter parameters
-        params = {}
-        if search_query:
-            # IMPORTANT: Do not combine offset_date with search.
-            # Use server-side search alone, then enforce date bounds client-side.
-            params["search"] = search_query
-            messages = []
-            async for msg in client.iter_messages(entity, **params):  # newest -> oldest
-                if to_date_obj and msg.date > to_date_obj:
-                    continue
-                if from_date_obj and msg.date < from_date_obj:
-                    break
-                messages.append(msg)
-                if len(messages) >= limit:
-                    break
-
-        else:
-            # Use server-side iteration when only date bounds are present
-            # (no search) to avoid over-fetching.
-            if from_date_obj or to_date_obj:
-                messages = []
-                if from_date_obj:
-                    # Walk forward from start date (oldest -> newest)
-                    async for msg in client.iter_messages(
-                        entity, offset_date=from_date_obj, reverse=True
-                    ):
-                        if to_date_obj and msg.date > to_date_obj:
-                            break
-                        if msg.date < from_date_obj:
-                            continue
-                        messages.append(msg)
-                        if len(messages) >= limit:
-                            break
-                else:
-                    # Only upper bound: walk backward from end bound
-                    async for msg in client.iter_messages(
-                        # offset_date is exclusive; +1µs makes to_date inclusive
-                        entity,
-                        offset_date=to_date_obj + timedelta(microseconds=1),
-                    ):
-                        messages.append(msg)
-                        if len(messages) >= limit:
-                            break
-            else:
-                messages = await client.get_messages(entity, limit=limit, **params)
+        messages = await _fetch_messages_with_filters(
+            entity, limit, search_query, from_date_obj, to_date_obj, topic_id
+        )
 
         if not messages:
             return "No messages found matching the criteria."
 
         lines = []
-        for msg in messages:
+        for msg in _normalize_messages(messages):
             sender_name = get_sender_name(msg)
             message_text = msg.message or "[Media/No text]"
             reply_info = ""
@@ -856,15 +904,59 @@ async def list_messages(
         return log_and_format_error("list_messages", e, chat_id=chat_id)
 
 
+def _validate_forum_entity(entity: Any) -> Optional[str]:
+    if not isinstance(entity, Channel) or not getattr(entity, "megagroup", False):
+        return "The specified chat is not a supergroup."
+    if not getattr(entity, "forum", False):
+        return "The specified supergroup does not have forum topics enabled."
+    return None
+
+
+def _format_topic_line(topic: Any, messages_map: Dict[int, Any]) -> str:
+    line_parts = [f"Topic ID: {topic.id}"]
+
+    title = getattr(topic, "title", None) or "(no title)"
+    line_parts.append(f"Title: {title}")
+
+    total_messages = getattr(topic, "total_messages", None)
+    if total_messages is not None:
+        line_parts.append(f"Messages: {total_messages}")
+
+    unread_count = getattr(topic, "unread_count", None)
+    if unread_count:
+        line_parts.append(f"Unread: {unread_count}")
+
+    if getattr(topic, "closed", False):
+        line_parts.append("Closed: Yes")
+
+    if getattr(topic, "hidden", False):
+        line_parts.append("Hidden: Yes")
+
+    top_message_id = getattr(topic, "top_message", None)
+    if isinstance(top_message_id, int):
+        top_message = messages_map.get(top_message_id)
+        if top_message and getattr(top_message, "date", None):
+            line_parts.append(f"Last Activity: {top_message.date.isoformat()}")
+
+    return " | ".join(line_parts)
+
+
+def _format_topics(topics: List[Any], messages_map: Dict[int, Any]) -> str:
+    return "\n".join(_format_topic_line(topic, messages_map) for topic in topics)
+
+
 @mcp.tool(annotations=ToolAnnotations(title="List Topics", openWorldHint=True, readOnlyHint=True))
 async def list_topics(
     chat_id: int,
     limit: int = 200,
     offset_topic: int = 0,
-    search_query: str = None,
+    search_query: Optional[str] = None,
 ) -> str:
     """
     Retrieve forum topics from a supergroup with the forum feature enabled.
+
+    The returned Topic IDs can be used with list_messages or get_history to filter
+    messages by topic. Use topic_id=1 for the General topic.
 
     Note for LLM: You can send a message to a selected topic via reply_to_message tool
     by using Topic ID as the message_id parameter.
@@ -876,18 +968,20 @@ async def list_topics(
         search_query: Optional query to filter topics by title.
     """
     try:
-        entity = await client.get_entity(chat_id)
+        entity = _normalize_entity(await client.get_entity(chat_id))
+        if not entity:
+            return f"Chat {chat_id} not found."
 
-        if not isinstance(entity, Channel) or not getattr(entity, "megagroup", False):
-            return "The specified chat is not a supergroup."
+        validation_error = _validate_forum_entity(entity)
+        if validation_error:
+            return validation_error
 
-        if not getattr(entity, "forum", False):
-            return "The specified supergroup does not have forum topics enabled."
+        input_channel = utils.get_input_channel(entity)
 
         result = await client(
             functions.channels.GetForumTopicsRequest(
-                channel=entity,
-                offset_date=0,
+                channel=input_channel,
+                offset_date=None,
                 offset_id=0,
                 offset_topic=offset_topic,
                 limit=limit,
@@ -900,38 +994,10 @@ async def list_topics(
             return "No topics found for this chat."
 
         messages_map = {}
-        if getattr(result, "messages", None):
-            messages_map = {message.id: message for message in result.messages}
+        for message in _normalize_messages(getattr(result, "messages", None)):
+            messages_map[message.id] = message
 
-        lines = []
-        for topic in topics:
-            line_parts = [f"Topic ID: {topic.id}"]
-
-            title = getattr(topic, "title", None) or "(no title)"
-            line_parts.append(f"Title: {title}")
-
-            total_messages = getattr(topic, "total_messages", None)
-            if total_messages is not None:
-                line_parts.append(f"Messages: {total_messages}")
-
-            unread_count = getattr(topic, "unread_count", None)
-            if unread_count:
-                line_parts.append(f"Unread: {unread_count}")
-
-            if getattr(topic, "closed", False):
-                line_parts.append("Closed: Yes")
-
-            if getattr(topic, "hidden", False):
-                line_parts.append("Hidden: Yes")
-
-            top_message_id = getattr(topic, "top_message", None)
-            top_message = messages_map.get(top_message_id)
-            if top_message and getattr(top_message, "date", None):
-                line_parts.append(f"Last Activity: {top_message.date.isoformat()}")
-
-            lines.append(" | ".join(line_parts))
-
-        return "\n".join(lines)
+        return _format_topics(topics, messages_map)
     except Exception as e:
         return log_and_format_error(
             "list_topics",
@@ -943,8 +1009,46 @@ async def list_topics(
         )
 
 
+def _list_chats_matches_type(entity: Any, chat_type: Optional[str]) -> bool:
+    if not chat_type:
+        return True
+    current_type = get_entity_filter_type(entity)
+    return current_type == chat_type.lower()
+
+
+def _format_dialog_info(dialog: Any) -> str:
+    entity = dialog.entity
+    chat_info = f"Chat ID: {entity.id}"
+
+    if hasattr(entity, "title"):
+        chat_info += f", Title: {entity.title}"
+    elif hasattr(entity, "first_name"):
+        name = f"{entity.first_name}"
+        if hasattr(entity, "last_name") and entity.last_name:
+            name += f" {entity.last_name}"
+        chat_info += f", Name: {name}"
+
+    chat_info += f", Type: {get_entity_type(entity)}"
+
+    if hasattr(entity, "username") and entity.username:
+        chat_info += f", Username: @{entity.username}"
+
+    unread_count = getattr(dialog, "unread_count", 0) or 0
+    inner_dialog = getattr(dialog, "dialog", None)
+    unread_mark = bool(getattr(inner_dialog, "unread_mark", False)) if inner_dialog else False
+
+    if unread_count > 0:
+        chat_info += f", Unread: {unread_count}"
+    elif unread_mark:
+        chat_info += ", Unread: marked"
+    else:
+        chat_info += ", No unread messages"
+
+    return chat_info
+
+
 @mcp.tool(annotations=ToolAnnotations(title="List Chats", openWorldHint=True, readOnlyHint=True))
-async def list_chats(chat_type: str = None, limit: int = 20) -> str:
+async def list_chats(chat_type: Optional[str] = None, limit: int = 20) -> str:
     """
     List available chats with metadata.
 
@@ -959,54 +1063,67 @@ async def list_chats(chat_type: str = None, limit: int = 20) -> str:
         for dialog in dialogs:
             entity = dialog.entity
 
-            # Filter by type if requested
-            current_type = get_entity_filter_type(entity)
-
-            if chat_type and current_type != chat_type.lower():
+            if not _list_chats_matches_type(entity, chat_type):
                 continue
 
-            # Format chat info
-            chat_info = f"Chat ID: {entity.id}"
-
-            if hasattr(entity, "title"):
-                chat_info += f", Title: {entity.title}"
-            elif hasattr(entity, "first_name"):
-                name = f"{entity.first_name}"
-                if hasattr(entity, "last_name") and entity.last_name:
-                    name += f" {entity.last_name}"
-                chat_info += f", Name: {name}"
-
-            chat_info += f", Type: {get_entity_type(entity)}"
-
-            if hasattr(entity, "username") and entity.username:
-                chat_info += f", Username: @{entity.username}"
-
-            # Add unread count if available
-            unread_count = getattr(dialog, "unread_count", 0) or 0
-            # Also check unread_mark (manual "mark as unread" flag)
-            inner_dialog = getattr(dialog, "dialog", None)
-            unread_mark = (
-                bool(getattr(inner_dialog, "unread_mark", False)) if inner_dialog else False
-            )
-
-            if unread_count > 0:
-                chat_info += f", Unread: {unread_count}"
-            elif unread_mark:
-                chat_info += ", Unread: marked"
-            else:
-                chat_info += ", No unread messages"
-
-            results.append(chat_info)
+            results.append(_format_dialog_info(dialog))
 
         if not results:
-            return f"No chats found matching the criteria."
+            return "No chats found matching the criteria."
 
         return "\n".join(results)
     except Exception as e:
         return log_and_format_error("list_chats", e, chat_type=chat_type, limit=limit)
 
 
-@mcp.tool(annotations=ToolAnnotations(title="Get Chat", openWorldHint=True, readOnlyHint=True))
+async def _build_chat_title_info(entity_obj: Any) -> List[str]:
+    details = [f"Title: {entity_obj.title}", f"Type: {get_entity_type(entity_obj)}"]
+    if hasattr(entity_obj, "username") and entity_obj.username:
+        details.append(f"Username: @{entity_obj.username}")
+
+    try:
+        participants_count = (await client.get_participants(entity_obj, limit=0)).total
+        details.append(f"Participants: {participants_count}")
+    except Exception as pe:
+        details.append(f"Participants: Error fetching ({pe})")
+    return details
+
+
+def _build_user_info(entity_obj: Any) -> List[str]:
+    name = f"{entity_obj.first_name}"
+    if entity_obj.last_name:
+        name += f" {entity_obj.last_name}"
+    details = [f"Name: {name}", f"Type: {get_entity_type(entity_obj)}"]
+    if entity_obj.username:
+        details.append(f"Username: @{entity_obj.username}")
+    if entity_obj.phone:
+        details.append(f"Phone: {entity_obj.phone}")
+    details.append(f"Bot: {'Yes' if entity_obj.bot else 'No'}")
+    details.append(f"Verified: {'Yes' if entity_obj.verified else 'No'}")
+    return details
+
+
+async def _append_dialog_info(entity: Any, result: List[str]) -> None:
+    dialog = await client.get_dialogs(limit=1, offset_id=0, offset_peer=entity)
+    if not dialog:
+        return
+    dialog = dialog[0]
+    result.append(f"Unread Messages: {dialog.unread_count}")
+    if not dialog.message:
+        return
+    last_msg = dialog.message
+    sender_name = "Unknown"
+    if last_msg.sender:
+        sender_name = getattr(last_msg.sender, "first_name", "") or getattr(
+            last_msg.sender, "title", "Unknown"
+        )
+        if hasattr(last_msg.sender, "last_name") and last_msg.sender.last_name:
+            sender_name += f" {last_msg.sender.last_name}"
+    sender_name = sender_name.strip() or "Unknown"
+    result.append(f"Last Message: From {sender_name} at {last_msg.date}")
+    result.append(f"Message: {last_msg.message or '[Media/No text]'}")
+
+
 @validate_id("chat_id")
 async def get_chat(chat_id: Union[int, str]) -> str:
     """
@@ -1016,7 +1133,9 @@ async def get_chat(chat_id: Union[int, str]) -> str:
         chat_id: The ID or username of the chat.
     """
     try:
-        entity = await client.get_entity(chat_id)
+        entity = _normalize_entity(await client.get_entity(chat_id))
+        if not entity:
+            return f"Chat {chat_id} not found."
 
         result = []
         result.append(f"ID: {entity.id}")
@@ -1024,54 +1143,14 @@ async def get_chat(chat_id: Union[int, str]) -> str:
         is_user = isinstance(entity, User)
 
         if hasattr(entity, "title"):
-            result.append(f"Title: {entity.title}")
-            result.append(f"Type: {get_entity_type(entity)}")
-            if hasattr(entity, "username") and entity.username:
-                result.append(f"Username: @{entity.username}")
-
-            # Fetch participants count reliably
-            try:
-                participants_count = (await client.get_participants(entity, limit=0)).total
-                result.append(f"Participants: {participants_count}")
-            except Exception as pe:
-                result.append(f"Participants: Error fetching ({pe})")
-
+            result.extend(await _build_chat_title_info(entity))
         elif is_user:
-            name = f"{entity.first_name}"
-            if entity.last_name:
-                name += f" {entity.last_name}"
-            result.append(f"Name: {name}")
-            result.append(f"Type: {get_entity_type(entity)}")
-            if entity.username:
-                result.append(f"Username: @{entity.username}")
-            if entity.phone:
-                result.append(f"Phone: {entity.phone}")
-            result.append(f"Bot: {'Yes' if entity.bot else 'No'}")
-            result.append(f"Verified: {'Yes' if entity.verified else 'No'}")
+            result.extend(_build_user_info(entity))
 
-        # Get last activity if it's a dialog
         try:
-            # Using get_dialogs might be slow if there are many dialogs
-            # Alternative: Get entity again via get_dialogs if needed for unread count
-            dialog = await client.get_dialogs(limit=1, offset_id=0, offset_peer=entity)
-            if dialog:
-                dialog = dialog[0]
-                result.append(f"Unread Messages: {dialog.unread_count}")
-                if dialog.message:
-                    last_msg = dialog.message
-                    sender_name = "Unknown"
-                    if last_msg.sender:
-                        sender_name = getattr(last_msg.sender, "first_name", "") or getattr(
-                            last_msg.sender, "title", "Unknown"
-                        )
-                        if hasattr(last_msg.sender, "last_name") and last_msg.sender.last_name:
-                            sender_name += f" {last_msg.sender.last_name}"
-                    sender_name = sender_name.strip() or "Unknown"
-                    result.append(f"Last Message: From {sender_name} at {last_msg.date}")
-                    result.append(f"Message: {last_msg.message or '[Media/No text]'}")
+            await _append_dialog_info(entity, result)
         except Exception as diag_ex:
             logger.warning(f"Could not get dialog info for {chat_id}: {diag_ex}")
-            pass
 
         return "\n".join(result)
     except Exception as e:
@@ -1093,40 +1172,49 @@ async def get_direct_chat_by_contact(contact_query: str) -> str:
     try:
         # Fetch all contacts using the correct Telethon method
         result = await client(functions.contacts.GetContactsRequest(hash=0))
-        contacts = result.users
-        found_contacts = []
-        for contact in contacts:
-            if not contact:
-                continue
-            name = (
+        contacts = getattr(result, "users", [])
+        query_lower = contact_query.lower()
+
+        def build_contact_name(contact: Any) -> str:
+            return (
                 f"{getattr(contact, 'first_name', '')} {getattr(contact, 'last_name', '')}".strip()
             )
+
+        def contact_matches(contact: Any) -> bool:
+            if not contact:
+                return False
+            name = build_contact_name(contact)
             username = getattr(contact, "username", "")
             phone = getattr(contact, "phone", "")
-            if (
-                contact_query.lower() in name.lower()
-                or (username and contact_query.lower() in username.lower())
+            return (
+                query_lower in name.lower()
+                or (username and query_lower in username.lower())
                 or (phone and contact_query in phone)
-            ):
-                found_contacts.append(contact)
+            )
+
+        found_contacts = [contact for contact in contacts if contact_matches(contact)]
         if not found_contacts:
             return f"No contacts found matching '{contact_query}'."
+
+        dialogs = await client.get_dialogs()
+        dialog_by_user_id = {
+            dialog.entity.id: dialog for dialog in dialogs if isinstance(dialog.entity, User)
+        }
+
         # If we found contacts, look for direct chats with them
         results = []
-        dialogs = await client.get_dialogs()
         for contact in found_contacts:
-            contact_name = (
-                f"{getattr(contact, 'first_name', '')} {getattr(contact, 'last_name', '')}".strip()
-            )
-            for dialog in dialogs:
-                if isinstance(dialog.entity, User) and dialog.entity.id == contact.id:
-                    chat_info = f"Chat ID: {dialog.entity.id}, Contact: {contact_name}"
-                    if getattr(contact, "username", ""):
-                        chat_info += f", Username: @{contact.username}"
-                    if dialog.unread_count:
-                        chat_info += f", Unread: {dialog.unread_count}"
-                    results.append(chat_info)
-                    break
+            contact_name = build_contact_name(contact)
+            dialog = dialog_by_user_id.get(contact.id)
+            if not dialog:
+                continue
+
+            chat_info = f"Chat ID: {dialog.entity.id}, Contact: {contact_name}"
+            if getattr(contact, "username", ""):
+                chat_info += f", Username: @{contact.username}"
+            if dialog.unread_count:
+                chat_info += f", Unread: {dialog.unread_count}"
+            results.append(chat_info)
         if not results:
             found_names = ", ".join(
                 [f"{c.first_name} {c.last_name}".strip() for c in found_contacts]
@@ -1158,8 +1246,6 @@ async def get_contact_chats(contact_id: Union[int, str]) -> str:
             f"{getattr(contact, 'first_name', '')} {getattr(contact, 'last_name', '')}".strip()
         )
 
-        # Find direct chat
-        direct_chat = None
         dialogs = await client.get_dialogs()
 
         results = []
@@ -1174,14 +1260,14 @@ async def get_contact_chats(contact_id: Union[int, str]) -> str:
                 break
 
         # Look for common groups/channels
-        common_chats = []
         try:
-            common = await client.get_common_chats(contact)
+            common = await getattr(client, "get_common_chats")(contact)
             for chat in common:
                 chat_type = get_entity_type(chat)
                 chat_info = f"Chat ID: {chat.id}, Title: {chat.title}, Type: {chat_type}"
                 results.append(chat_info)
-        except:
+        except Exception as e:
+            logger.warning(f"get_contact_chats failed to fetch common chats: {e}")
             results.append("Could not retrieve common groups.")
 
         if not results:
@@ -1233,9 +1319,29 @@ async def get_last_interaction(contact_id: Union[int, str]) -> str:
         return log_and_format_error("get_last_interaction", e, contact_id=contact_id)
 
 
-@mcp.tool(
-    annotations=ToolAnnotations(title="Get Message Context", openWorldHint=True, readOnlyHint=True)
-)
+async def _build_reply_context(chat: Any, msg: Any) -> str:
+    if not msg.reply_to or not msg.reply_to.reply_to_msg_id:
+        return ""
+
+    reply_id = msg.reply_to.reply_to_msg_id
+    try:
+        replied_msg = await client.get_messages(chat, ids=reply_id)
+        replied_msg = _normalize_entity(replied_msg)
+        if replied_msg:
+            replied_sender = "Unknown"
+            if replied_msg.sender:
+                replied_sender = getattr(replied_msg.sender, "first_name", "") or getattr(
+                    replied_msg.sender, "title", "Unknown"
+                )
+            return (
+                f" | reply to {reply_id}\n  → Replied message: [{replied_sender}] "
+                f"{replied_msg.message or '[Media/No text]'}"
+            )
+    except Exception:
+        return f" | reply to {reply_id} (original message not found)"
+    return f" | reply to {reply_id} (original message not found)"
+
+
 @validate_id("chat_id")
 async def get_message_context(
     chat_id: Union[int, str], message_id: int, context_size: int = 3
@@ -1249,17 +1355,16 @@ async def get_message_context(
         context_size: Number of messages before and after to include.
     """
     try:
-        chat = await client.get_entity(chat_id)
+        chat = _normalize_entity(await client.get_entity(chat_id))
+        if not chat:
+            return f"Chat {chat_id} not found."
         # Get messages around the specified message
-        messages_before = await client.get_messages(chat, limit=context_size, max_id=message_id)
-        central_message = await client.get_messages(chat, ids=message_id)
-        # Fix: get_messages(ids=...) returns a single Message, not a list
-        if central_message is not None and not isinstance(central_message, list):
-            central_message = [central_message]
-        elif central_message is None:
-            central_message = []
-        messages_after = await client.get_messages(
-            chat, limit=context_size, min_id=message_id, reverse=True
+        messages_before = _normalize_messages(
+            await client.get_messages(chat, limit=context_size, max_id=message_id)
+        )
+        central_message = _normalize_messages(await client.get_messages(chat, ids=message_id))
+        messages_after = _normalize_messages(
+            await client.get_messages(chat, limit=context_size, min_id=message_id, reverse=True)
         )
         if not central_message:
             return f"Message with ID {message_id} not found in chat {chat_id}."
@@ -1271,22 +1376,7 @@ async def get_message_context(
             sender_name = get_sender_name(msg)
             highlight = " [THIS MESSAGE]" if msg.id == message_id else ""
 
-            # Check if this message is a reply and get the replied message
-            reply_content = ""
-            if msg.reply_to and msg.reply_to.reply_to_msg_id:
-                try:
-                    replied_msg = await client.get_messages(chat, ids=msg.reply_to.reply_to_msg_id)
-                    if replied_msg:
-                        replied_sender = "Unknown"
-                        if replied_msg.sender:
-                            replied_sender = getattr(
-                                replied_msg.sender, "first_name", ""
-                            ) or getattr(replied_msg.sender, "title", "Unknown")
-                        reply_content = f" | reply to {msg.reply_to.reply_to_msg_id}\n  → Replied message: [{replied_sender}] {replied_msg.message or '[Media/No text]'}"
-                except Exception:
-                    reply_content = (
-                        f" | reply to {msg.reply_to.reply_to_msg_id} (original message not found)"
-                    )
+            reply_content = await _build_reply_context(chat, msg)
 
             results.append(
                 f"ID: {msg.id} | {sender_name} | {msg.date}{highlight}{reply_content}\n{msg.message or '[Media/No text]'}\n"
@@ -1302,11 +1392,78 @@ async def get_message_context(
         )
 
 
-@mcp.tool(
-    annotations=ToolAnnotations(
-        title="Add Contact", openWorldHint=True, destructiveHint=True, idempotentHint=True
+async def _add_contact_by_username(username_clean: str, first_name: str, last_name: str) -> str:
+    resolve_result = await client(
+        functions.contacts.ResolveUsernameRequest(username=username_clean)
     )
-)
+
+    if not resolve_result.users:
+        return f"Error: User with username @{username_clean} not found."
+
+    user = resolve_result.users[0]
+    if not isinstance(user, User):
+        return "Error: Resolved entity is not a user."
+
+    from telethon.tl.types import InputUser
+
+    result = await client(
+        functions.contacts.AddContactRequest(
+            id=InputUser(user_id=user.id, access_hash=user.access_hash),
+            first_name=first_name,
+            last_name=last_name,
+            phone="",
+        )
+    )
+
+    if hasattr(result, "updates") and result.updates:
+        return f"Contact {first_name} {last_name} (@{username_clean}) added successfully."
+    return f"Contact {first_name} {last_name} (@{username_clean}) added successfully (no updates returned)."
+
+
+async def _add_contact_by_phone(phone_value: str, first_name: str, last_name: str) -> str:
+    try:
+        from telethon.tl.types import InputPhoneContact
+
+        result = await client(
+            functions.contacts.ImportContactsRequest(
+                contacts=[
+                    InputPhoneContact(
+                        client_id=0,
+                        phone=phone_value,
+                        first_name=first_name,
+                        last_name=last_name,
+                    )
+                ]
+            )
+        )
+        if result.imported:
+            return f"Contact {first_name} {last_name} added successfully."
+        return f"Contact not added. Response: {str(result)}"
+    except (ImportError, AttributeError):
+        try:
+            result = await client(
+                functions.contacts.ImportContactsRequest(
+                    contacts=[
+                        {
+                            "client_id": 0,
+                            "phone": phone_value,
+                            "first_name": first_name,
+                            "last_name": last_name,
+                        }
+                    ]
+                )
+            )
+            if hasattr(result, "imported") and result.imported:
+                return f"Contact {first_name} {last_name} added successfully (alt method)."
+            return f"Contact not added. Alternative method response: {str(result)}"
+        except Exception as alt_e:
+            logger.exception(f"add_contact (alt method) failed (phone={phone_value})")
+            return log_and_format_error("add_contact", alt_e, phone=phone_value)
+    except Exception as e:
+        logger.exception(f"add_contact failed (phone={phone_value})")
+        return log_and_format_error("add_contact", e, phone=phone_value)
+
+
 async def add_contact(
     phone: Optional[str] = None,
     first_name: str = "",
@@ -1340,96 +1497,13 @@ async def add_contact(
             if not username_clean:
                 return "Error: Username cannot be empty."
 
-            # Resolve username to get user information
-            try:
-                resolve_result = await client(
-                    functions.contacts.ResolveUsernameRequest(username=username_clean)
-                )
-
-                # Extract user from the result
-                if not resolve_result.users:
-                    return f"Error: User with username @{username_clean} not found."
-
-                user = resolve_result.users[0]
-                if not isinstance(user, User):
-                    return f"Error: Resolved entity is not a user."
-
-                user_id = user.id
-                access_hash = user.access_hash
-
-                # Use contacts.addContact to add the contact by user ID
-                from telethon.tl.types import InputUser
-
-                result = await client(
-                    functions.contacts.AddContactRequest(
-                        id=InputUser(user_id=user_id, access_hash=access_hash),
-                        first_name=first_name,
-                        last_name=last_name,
-                        phone="",  # Empty phone for username-based contacts
-                    )
-                )
-
-                if hasattr(result, "updates") and result.updates:
-                    return (
-                        f"Contact {first_name} {last_name} (@{username_clean}) added successfully."
-                    )
-                else:
-                    return f"Contact {first_name} {last_name} (@{username_clean}) added successfully (no updates returned)."
-
-            except Exception as resolve_e:
-                logger.exception(
-                    f"add_contact (username resolve) failed (username={username_clean})"
-                )
-                return log_and_format_error("add_contact", resolve_e, username=username_clean)
+            return await _add_contact_by_username(username_clean, first_name, last_name)
 
         elif phone:
             # Original phone-based contact addition
-            from telethon.tl.types import InputPhoneContact
-
-            result = await client(
-                functions.contacts.ImportContactsRequest(
-                    contacts=[
-                        InputPhoneContact(
-                            client_id=0,
-                            phone=phone,
-                            first_name=first_name,
-                            last_name=last_name,
-                        )
-                    ]
-                )
-            )
-            if result.imported:
-                return f"Contact {first_name} {last_name} added successfully."
-            else:
-                return f"Contact not added. Response: {str(result)}"
+            return await _add_contact_by_phone(phone, first_name, last_name)
         else:
             return "Error: Phone number is required when username is not provided."
-    except (ImportError, AttributeError) as type_err:
-        # Try alternative approach using raw API (only for phone-based)
-        if phone and not username:
-            try:
-                result = await client(
-                    functions.contacts.ImportContactsRequest(
-                        contacts=[
-                            {
-                                "client_id": 0,
-                                "phone": phone,
-                                "first_name": first_name,
-                                "last_name": last_name,
-                            }
-                        ]
-                    )
-                )
-                if hasattr(result, "imported") and result.imported:
-                    return f"Contact {first_name} {last_name} added successfully (alt method)."
-                else:
-                    return f"Contact not added. Alternative method response: {str(result)}"
-            except Exception as alt_e:
-                logger.exception(f"add_contact (alt method) failed (phone={phone})")
-                return log_and_format_error("add_contact", alt_e, phone=phone)
-        else:
-            logger.exception(f"add_contact (type error) failed")
-            return log_and_format_error("add_contact", type_err)
     except Exception as e:
         logger.exception(f"add_contact failed (phone={phone}, username={username})")
         return log_and_format_error("add_contact", e, phone=phone, username=username)
@@ -1507,9 +1581,32 @@ async def get_me() -> str:
         return log_and_format_error("get_me", e)
 
 
-@mcp.tool(
-    annotations=ToolAnnotations(title="Create Group", openWorldHint=True, destructiveHint=True)
-)
+async def _resolve_group_users(
+    user_ids: List[Union[int, str]],
+) -> Tuple[Optional[List[Any]], Optional[str]]:
+    users = []
+    for user_id in user_ids:
+        try:
+            user = await client.get_entity(user_id)
+            users.append(user)
+        except Exception as e:
+            logger.error(f"Failed to get entity for user ID {user_id}: {e}")
+            return None, f"Error: Could not find user with ID {user_id}"
+    if not users:
+        return None, "Error: No valid users provided"
+    return users, None
+
+
+def _extract_group_id(result_obj: Any) -> Optional[str]:
+    if hasattr(result_obj, "chats") and result_obj.chats:
+        return str(result_obj.chats[0].id)
+    if hasattr(result_obj, "chat") and result_obj.chat:
+        return str(result_obj.chat.id)
+    if hasattr(result_obj, "chat_id"):
+        return str(result_obj.chat_id)
+    return None
+
+
 @validate_id("user_ids")
 async def create_group(title: str, user_ids: List[Union[int, str]]) -> str:
     """
@@ -1520,49 +1617,28 @@ async def create_group(title: str, user_ids: List[Union[int, str]]) -> str:
         user_ids: List of user IDs or usernames to add to the group
     """
     try:
-        # Convert user IDs to entities
-        users = []
-        for user_id in user_ids:
-            try:
-                user = await client.get_entity(user_id)
-                users.append(user)
-            except Exception as e:
-                logger.error(f"Failed to get entity for user ID {user_id}: {e}")
-                return f"Error: Could not find user with ID {user_id}"
+        users, error = await _resolve_group_users(user_ids)
+        if error:
+            return error
 
-        if not users:
-            return "Error: No valid users provided"
-
-        # Create the group with the users
         try:
-            # Create a new chat with selected users
             result = await client(functions.messages.CreateChatRequest(users=users, title=title))
+            group_id = _extract_group_id(result)
+            if group_id:
+                return f"Group created with ID: {group_id}"
 
-            # Check what type of response we got
-            if hasattr(result, "chats") and result.chats:
-                created_chat = result.chats[0]
-                return f"Group created with ID: {created_chat.id}"
-            elif hasattr(result, "chat") and result.chat:
-                return f"Group created with ID: {result.chat.id}"
-            elif hasattr(result, "chat_id"):
-                return f"Group created with ID: {result.chat_id}"
-            else:
-                # If we can't determine the chat ID directly from the result
-                # Try to find it in recent dialogs
-                await asyncio.sleep(1)  # Give Telegram a moment to register the new group
-                dialogs = await client.get_dialogs(limit=5)  # Get recent dialogs
-                for dialog in dialogs:
-                    if dialog.title == title:
-                        return f"Group created with ID: {dialog.id}"
+            await asyncio.sleep(1)
+            dialogs = await client.get_dialogs(limit=5)
+            for dialog in dialogs:
+                if dialog.title == title:
+                    return f"Group created with ID: {dialog.id}"
 
-                # If we still can't find it, at least return success
-                return f"Group created successfully. Please check your recent chats for '{title}'."
+            return f"Group created successfully. Please check your recent chats for '{title}'."
 
         except Exception as create_err:
             if "PEER_FLOOD" in str(create_err):
                 return "Error: Cannot create group due to Telegram limits. Try again later."
-            else:
-                raise  # Let the outer exception handler catch it
+            raise
     except Exception as e:
         logger.exception(f"create_group failed (title={title}, user_ids={user_ids})")
         return log_and_format_error("create_group", e, title=title, user_ids=user_ids)
@@ -1699,7 +1775,7 @@ async def leave_chat(chat_id: Union[int, str]) -> str:
             return log_and_format_error(
                 "leave_chat",
                 Exception(
-                    f"Error leaving chat: This appears to be a channel/supergroup. Please check the chat ID and try again."
+                    "Error leaving chat: This appears to be a channel/supergroup. Please check the chat ID and try again."
                 ),
                 chat_id=chat_id,
             )
@@ -1876,11 +1952,48 @@ async def get_privacy_settings() -> str:
         return log_and_format_error("get_privacy_settings", e)
 
 
-@mcp.tool(
-    annotations=ToolAnnotations(
-        title="Set Privacy Settings", openWorldHint=True, destructiveHint=True, idempotentHint=True
-    )
-)
+async def _resolve_privacy_entities(user_ids: List[Union[int, str]]) -> List[Any]:
+    resolved = []
+    for user_id in user_ids:
+        try:
+            user = await client.get_entity(user_id)
+            resolved.append(user)
+        except Exception as user_err:
+            logger.warning(f"Could not get entity for user ID {user_id}: {user_err}")
+    return resolved
+
+
+async def _build_privacy_rules(
+    allow_users: Optional[List[Union[int, str]]],
+    disallow_users: Optional[List[Union[int, str]]],
+    allow_all_cls: Any,
+    allow_users_cls: Any,
+    disallow_users_cls: Any,
+) -> Tuple[List[Any], Optional[str]]:
+    rules = []
+    if not allow_users:
+        rules.append(allow_all_cls())
+    else:
+        try:
+            allow_entities = await _resolve_privacy_entities(allow_users)
+            if allow_entities:
+                rules.append(allow_users_cls(users=allow_entities))
+        except Exception as allow_err:
+            logger.error(f"Error processing allowed users: {allow_err}")
+            return [], str(allow_err)
+
+    if disallow_users:
+        try:
+            disallow_entities = await _resolve_privacy_entities(disallow_users)
+            if disallow_entities:
+                rules.append(disallow_users_cls(users=disallow_entities))
+        except Exception as disallow_err:
+            logger.error(f"Error processing disallowed users: {disallow_err}")
+            return [], str(disallow_err)
+
+    return rules, None
+
+
 @validate_id("allow_users", "disallow_users")
 async def set_privacy_settings(
     key: str,
@@ -1898,13 +2011,12 @@ async def set_privacy_settings(
     try:
         # Import needed types
         from telethon.tl.types import (
-            InputPrivacyKeyStatusTimestamp,
             InputPrivacyKeyPhoneNumber,
             InputPrivacyKeyProfilePhoto,
+            InputPrivacyKeyStatusTimestamp,
+            InputPrivacyValueAllowAll,
             InputPrivacyValueAllowUsers,
             InputPrivacyValueDisallowUsers,
-            InputPrivacyValueAllowAll,
-            InputPrivacyValueDisallowAll,
         )
 
         # Map the simplified keys to their corresponding input types
@@ -1920,52 +2032,19 @@ async def set_privacy_settings(
 
         privacy_key = key_mapping[key]()
 
-        # Prepare the rules
-        rules = []
-
-        # Process allow rules
-        if allow_users is None or len(allow_users) == 0:
-            # If no specific users to allow, allow everyone by default
-            rules.append(InputPrivacyValueAllowAll())
-        else:
-            # Convert user IDs to InputUser entities
-            try:
-                allow_entities = []
-                for user_id in allow_users:
-                    try:
-                        user = await client.get_entity(user_id)
-                        allow_entities.append(user)
-                    except Exception as user_err:
-                        logger.warning(f"Could not get entity for user ID {user_id}: {user_err}")
-
-                if allow_entities:
-                    rules.append(InputPrivacyValueAllowUsers(users=allow_entities))
-            except Exception as allow_err:
-                logger.error(f"Error processing allowed users: {allow_err}")
-                return log_and_format_error("set_privacy_settings", allow_err, key=key)
-
-        # Process disallow rules
-        if disallow_users and len(disallow_users) > 0:
-            try:
-                disallow_entities = []
-                for user_id in disallow_users:
-                    try:
-                        user = await client.get_entity(user_id)
-                        disallow_entities.append(user)
-                    except Exception as user_err:
-                        logger.warning(f"Could not get entity for user ID {user_id}: {user_err}")
-
-                if disallow_entities:
-                    rules.append(InputPrivacyValueDisallowUsers(users=disallow_entities))
-            except Exception as disallow_err:
-                logger.error(f"Error processing disallowed users: {disallow_err}")
-                return log_and_format_error("set_privacy_settings", disallow_err, key=key)
+        rules, rules_error = await _build_privacy_rules(
+            allow_users,
+            disallow_users,
+            InputPrivacyValueAllowAll,
+            InputPrivacyValueAllowUsers,
+            InputPrivacyValueDisallowUsers,
+        )
+        if rules_error:
+            return log_and_format_error("set_privacy_settings", Exception(rules_error), key=key)
 
         # Apply the privacy settings
         try:
-            result = await client(
-                functions.account.SetPrivacyRequest(key=privacy_key, rules=rules)
-            )
+            await client(functions.account.SetPrivacyRequest(key=privacy_key, rules=rules))
             return f"Privacy settings for {key} updated successfully."
         except TypeError as type_err:
             if "TLObject was expected" in str(type_err):
@@ -2194,7 +2273,7 @@ async def promote_admin(
         )
 
         try:
-            result = await client(
+            await client(
                 functions.channels.EditAdminRequest(
                     channel=chat, user_id=user, admin_rights=admin_rights, rank="Admin"
                 )
@@ -2247,7 +2326,7 @@ async def demote_admin(group_id: Union[int, str], user_id: Union[int, str]) -> s
         )
 
         try:
-            result = await client(
+            await client(
                 functions.channels.EditAdminRequest(
                     channel=chat, user_id=user, admin_rights=admin_rights, rank=""
                 )
@@ -2480,7 +2559,7 @@ async def join_chat_by_link(link: str) -> str:
             invite_info = await client(functions.messages.CheckChatInviteRequest(hash=hash_part))
             if hasattr(invite_info, "chat") and invite_info.chat:
                 # If we got chat info, we're already a member
-                chat_title = getattr(invite_info.chat, "title", "Unknown Chat")
+                chat_title = getattr(invite_info.chat, "title", UNKNOWN_CHAT_TITLE)
                 return f"You are already a member of this chat: {chat_title}"
         except Exception:
             # This often fails if not a member - just continue
@@ -2489,9 +2568,9 @@ async def join_chat_by_link(link: str) -> str:
         # Join the chat using the hash
         result = await client(functions.messages.ImportChatInviteRequest(hash=hash_part))
         if result and hasattr(result, "chats") and result.chats:
-            chat_title = getattr(result.chats[0], "title", "Unknown Chat")
+            chat_title = getattr(result.chats[0], "title", UNKNOWN_CHAT_TITLE)
             return f"Successfully joined chat: {chat_title}"
-        return f"Joined chat via invite hash."
+        return "Joined chat via invite hash."
     except Exception as e:
         err_str = str(e).lower()
         if "expired" in err_str:
@@ -2541,65 +2620,67 @@ async def export_chat_invite(chat_id: Union[int, str]) -> str:
         return log_and_format_error("export_chat_invite", e, chat_id=chat_id)
 
 
-@mcp.tool(
-    annotations=ToolAnnotations(
-        title="Import Chat Invite", openWorldHint=True, destructiveHint=True, idempotentHint=True
-    )
-)
-async def import_chat_invite(hash: str) -> str:
+async def _check_invite_membership(invite_hash: str) -> Optional[str]:
+    invite_info = await client(functions.messages.CheckChatInviteRequest(hash=invite_hash))
+    if hasattr(invite_info, "chat") and invite_info.chat:
+        chat_title = getattr(invite_info.chat, "title", UNKNOWN_CHAT_TITLE)
+        return f"You are already a member of this chat: {chat_title}"
+    return None
+
+
+def _interpret_invite_error(err_str: str) -> Optional[str]:
+    if "expired" in err_str:
+        return "The invite hash has expired and is no longer valid."
+    if "invalid" in err_str:
+        return "The invite hash is invalid or malformed."
+    if "already" in err_str and "participant" in err_str:
+        return "You are already a member of this chat."
+    if "admin" in err_str:
+        return "Cannot join this chat - requires admin approval."
+    if "too much" in err_str or "too many" in err_str:
+        return "Cannot join this chat - it has reached maximum number of participants."
+    return None
+
+
+async def _join_invite_hash(invite_hash: str) -> str:
+    result = await client(functions.messages.ImportChatInviteRequest(hash=invite_hash))
+    if result and hasattr(result, "chats") and result.chats:
+        chat_title = getattr(result.chats[0], "title", UNKNOWN_CHAT_TITLE)
+        return f"Successfully joined chat: {chat_title}"
+    return "Joined chat via invite hash."
+
+
+async def import_chat_invite(invite_hash: str) -> str:
     """
     Import a chat invite by hash.
     """
     try:
         # Remove any prefixes like '+' if present
-        if hash.startswith("+"):
-            hash = hash[1:]
+        if invite_hash.startswith("+"):
+            invite_hash = invite_hash[1:]
 
         # Try checking the invite before joining
         try:
-            from telethon.errors import (
-                InviteHashExpiredError,
-                InviteHashInvalidError,
-                UserAlreadyParticipantError,
-                ChatAdminRequiredError,
-                UsersTooMuchError,
-            )
-
-            # Try to check invite info first (will often fail if not a member)
-            invite_info = await client(functions.messages.CheckChatInviteRequest(hash=hash))
-            if hasattr(invite_info, "chat") and invite_info.chat:
-                # If we got chat info, we're already a member
-                chat_title = getattr(invite_info.chat, "title", "Unknown Chat")
-                return f"You are already a member of this chat: {chat_title}"
+            membership = await _check_invite_membership(invite_hash)
+            if membership:
+                return membership
         except Exception as check_err:
             # This often fails if not a member - just continue
-            pass
+            logger.debug(f"import_chat_invite check failed: {check_err}")
 
         # Join the chat using the hash
         try:
-            result = await client(functions.messages.ImportChatInviteRequest(hash=hash))
-            if result and hasattr(result, "chats") and result.chats:
-                chat_title = getattr(result.chats[0], "title", "Unknown Chat")
-                return f"Successfully joined chat: {chat_title}"
-            return f"Joined chat via invite hash."
+            return await _join_invite_hash(invite_hash)
         except Exception as join_err:
             err_str = str(join_err).lower()
-            if "expired" in err_str:
-                return "The invite hash has expired and is no longer valid."
-            elif "invalid" in err_str:
-                return "The invite hash is invalid or malformed."
-            elif "already" in err_str and "participant" in err_str:
-                return "You are already a member of this chat."
-            elif "admin" in err_str:
-                return "Cannot join this chat - requires admin approval."
-            elif "too much" in err_str or "too many" in err_str:
-                return "Cannot join this chat - it has reached maximum number of participants."
-            else:
-                raise  # Re-raise to be caught by the outer exception handler
+            message = _interpret_invite_error(err_str)
+            if message:
+                return message
+            raise  # Re-raise to be caught by the outer exception handler
 
     except Exception as e:
-        logger.exception(f"import_chat_invite failed (hash={hash})")
-        return log_and_format_error("import_chat_invite", e, hash=hash)
+        logger.exception(f"import_chat_invite failed (hash={invite_hash})")
+        return log_and_format_error("import_chat_invite", e, hash=invite_hash)
 
 
 @mcp.tool(
@@ -2874,6 +2955,7 @@ async def mute_chat(chat_id: Union[int, str]) -> str:
         )
         return f"Chat {chat_id} muted."
     except (ImportError, AttributeError) as type_err:
+        logger.debug(f"mute_chat fallback due to type error: {type_err}")
         try:
             # Alternative approach directly using raw API
             peer = await client.get_input_entity(chat_id)
@@ -2917,6 +2999,7 @@ async def unmute_chat(chat_id: Union[int, str]) -> str:
         )
         return f"Chat {chat_id} unmuted."
     except (ImportError, AttributeError) as type_err:
+        logger.debug(f"unmute_chat fallback due to type error: {type_err}")
         try:
             # Alternative approach directly using raw API
             peer = await client.get_input_entity(chat_id)
@@ -3162,16 +3245,16 @@ async def set_bot_commands(bot_username: str, commands: list) -> str:
             return "Error: This function can only be used by bot accounts. Your current Telegram account is a regular user account, not a bot."
 
         # Import required types
-        from telethon.tl.types import BotCommand, BotCommandScopeDefault
         from telethon.tl.functions.bots import SetBotCommandsRequest
+        from telethon.tl.types import BotCommand, BotCommandScopeDefault
 
         # Create BotCommand objects from the command dictionaries
         bot_commands = [
             BotCommand(command=c["command"], description=c["description"]) for c in commands
         ]
 
-        # Get the bot entity
-        bot = await client.get_entity(bot_username)
+        # Ensure the bot entity exists
+        await client.get_entity(bot_username)
 
         # Set the commands with proper scope
         await client(
@@ -3193,13 +3276,35 @@ async def set_bot_commands(bot_username: str, commands: list) -> str:
 
 @mcp.tool(annotations=ToolAnnotations(title="Get History", openWorldHint=True, readOnlyHint=True))
 @validate_id("chat_id")
-async def get_history(chat_id: Union[int, str], limit: int = 100) -> str:
+async def get_history(
+    chat_id: Union[int, str], limit: int = 100, topic_id: Optional[int] = None
+) -> str:
     """
     Get full chat history (up to limit).
+
+    Args:
+        chat_id: The ID or username of the chat to get messages from.
+        limit: Maximum number of messages to retrieve.
+        topic_id: Filter messages by forum topic ID (use 1 for General topic).
     """
     try:
         entity = await client.get_entity(chat_id)
-        messages = await client.get_messages(entity, limit=limit)
+
+        # Handle forum topic filtering
+        if topic_id is not None:
+            if topic_id == 1:
+                # General topic: filter messages without reply_to
+                messages = []
+                async for msg in client.iter_messages(entity, limit=limit * 2):
+                    if not msg.reply_to or not getattr(msg.reply_to, "reply_to_top_id", None):
+                        messages.append(msg)
+                        if len(messages) >= limit:
+                            break
+            else:
+                # Other topics: use reply_to parameter
+                messages = await client.get_messages(entity, limit=limit, reply_to=topic_id)
+        else:
+            messages = await client.get_messages(entity, limit=limit)
 
         lines = []
         for msg in messages:
@@ -3359,11 +3464,12 @@ async def create_poll(
             try:
                 close_date_obj = datetime.fromisoformat(close_date.replace("Z", "+00:00"))
             except ValueError:
-                return f"Invalid close_date format. Use YYYY-MM-DD HH:MM:SS format."
+                return "Invalid close_date format. Use YYYY-MM-DD HH:MM:SS format."
 
         # Create the poll using InputMediaPoll with SendMediaRequest
-        from telethon.tl.types import InputMediaPoll, Poll, PollAnswer, TextWithEntities
         import random
+
+        from telethon.tl.types import InputMediaPoll, Poll, PollAnswer, TextWithEntities
 
         poll = Poll(
             id=random.randint(0, 2**63 - 1),
@@ -3378,7 +3484,7 @@ async def create_poll(
             close_date=close_date_obj,
         )
 
-        result = await client(
+        await client(
             functions.messages.SendMediaRequest(
                 peer=entity,
                 media=InputMediaPoll(poll=poll),
@@ -3490,7 +3596,7 @@ async def get_message_reactions(
         limit: Maximum number of users to return per reaction (default: 50)
     """
     try:
-        from telethon.tl.types import ReactionEmoji, ReactionCustomEmoji
+        from telethon.tl.types import ReactionCustomEmoji, ReactionEmoji
 
         peer = await client.get_input_entity(chat_id)
 
@@ -3593,7 +3699,34 @@ async def save_draft(
         return log_and_format_error("save_draft", e, chat_id=chat_id)
 
 
-@mcp.tool(annotations=ToolAnnotations(title="Get Drafts", openWorldHint=True, readOnlyHint=True))
+def _extract_peer_id(update: Any) -> Optional[int]:
+    if not hasattr(update, "peer"):
+        return None
+    peer = update.peer
+    if hasattr(peer, "user_id"):
+        return peer.user_id
+    if hasattr(peer, "chat_id"):
+        return -peer.chat_id
+    if hasattr(peer, "channel_id"):
+        return -1000000000000 - peer.channel_id
+    return None
+
+
+def _build_draft_data(update: Any) -> Optional[Dict[str, Any]]:
+    if not hasattr(update, "draft") or not update.draft:
+        return None
+    draft = update.draft
+    return {
+        "peer_id": _extract_peer_id(update),
+        "message": getattr(draft, "message", ""),
+        "date": draft.date.isoformat() if getattr(draft, "date", None) else None,
+        "no_webpage": getattr(draft, "no_webpage", False),
+        "reply_to_msg_id": (
+            draft.reply_to.reply_to_msg_id if getattr(draft, "reply_to", None) else None
+        ),
+    }
+
+
 async def get_drafts() -> str:
     """
     Get all draft messages across all chats.
@@ -3605,39 +3738,10 @@ async def get_drafts() -> str:
         # The result contains updates with draft info
         drafts_info = []
 
-        # GetAllDraftsRequest returns Updates object with updates array
-        if hasattr(result, "updates"):
-            for update in result.updates:
-                if hasattr(update, "draft") and update.draft:
-                    draft = update.draft
-                    peer_id = None
-
-                    # Extract peer ID based on type
-                    if hasattr(update, "peer"):
-                        peer = update.peer
-                        if hasattr(peer, "user_id"):
-                            peer_id = peer.user_id
-                        elif hasattr(peer, "chat_id"):
-                            peer_id = -peer.chat_id
-                        elif hasattr(peer, "channel_id"):
-                            peer_id = -1000000000000 - peer.channel_id
-
-                    draft_data = {
-                        "peer_id": peer_id,
-                        "message": getattr(draft, "message", ""),
-                        "date": (
-                            draft.date.isoformat()
-                            if hasattr(draft, "date") and draft.date
-                            else None
-                        ),
-                        "no_webpage": getattr(draft, "no_webpage", False),
-                        "reply_to_msg_id": (
-                            draft.reply_to.reply_to_msg_id
-                            if hasattr(draft, "reply_to") and draft.reply_to
-                            else None
-                        ),
-                    }
-                    drafts_info.append(draft_data)
+        for update in getattr(result, "updates", []):
+            draft_data = _build_draft_data(update)
+            if draft_data:
+                drafts_info.append(draft_data)
 
         if not drafts_info:
             return "No drafts found."
@@ -3734,7 +3838,21 @@ async def list_folders() -> str:
         return log_and_format_error("list_folders", e, ErrorCategory.FOLDER)
 
 
-@mcp.tool(annotations=ToolAnnotations(title="Get Folder", openWorldHint=True, readOnlyHint=True))
+async def _resolve_folder_peer(peer: Any) -> Dict[str, Any]:
+    try:
+        entity = await client.get_entity(peer)
+        chat_info = {
+            "id": entity.id,
+            "name": getattr(entity, "title", None) or getattr(entity, "first_name", "Unknown"),
+            "type": get_entity_type(entity),
+        }
+        if hasattr(entity, "username") and entity.username:
+            chat_info["username"] = entity.username
+        return chat_info
+    except Exception:
+        return {"id": str(peer), "name": "Unknown", "type": "Unknown"}
+
+
 async def get_folder(folder_id: int) -> str:
     """
     Get detailed information about a specific folder including all included chats.
@@ -3759,49 +3877,17 @@ async def get_folder(folder_id: int) -> str:
         # Resolve included peers to readable names
         included_chats = []
         for peer in getattr(target_folder, "include_peers", []):
-            try:
-                entity = await client.get_entity(peer)
-                chat_info = {
-                    "id": entity.id,
-                    "name": getattr(entity, "title", None)
-                    or getattr(entity, "first_name", "Unknown"),
-                    "type": get_entity_type(entity),
-                }
-                if hasattr(entity, "username") and entity.username:
-                    chat_info["username"] = entity.username
-                included_chats.append(chat_info)
-            except Exception:
-                included_chats.append({"id": str(peer), "name": "Unknown", "type": "Unknown"})
+            included_chats.append(await _resolve_folder_peer(peer))
 
         # Resolve excluded peers
         excluded_chats = []
         for peer in getattr(target_folder, "exclude_peers", []):
-            try:
-                entity = await client.get_entity(peer)
-                chat_info = {
-                    "id": entity.id,
-                    "name": getattr(entity, "title", None)
-                    or getattr(entity, "first_name", "Unknown"),
-                    "type": get_entity_type(entity),
-                }
-                excluded_chats.append(chat_info)
-            except Exception:
-                excluded_chats.append({"id": str(peer), "name": "Unknown", "type": "Unknown"})
+            excluded_chats.append(await _resolve_folder_peer(peer))
 
         # Resolve pinned peers
         pinned_chats = []
         for peer in getattr(target_folder, "pinned_peers", []):
-            try:
-                entity = await client.get_entity(peer)
-                chat_info = {
-                    "id": entity.id,
-                    "name": getattr(entity, "title", None)
-                    or getattr(entity, "first_name", "Unknown"),
-                    "type": get_entity_type(entity),
-                }
-                pinned_chats.append(chat_info)
-            except Exception:
-                pinned_chats.append({"id": str(peer), "name": "Unknown", "type": "Unknown"})
+            pinned_chats.append(await _resolve_folder_peer(peer))
 
         # Handle title which can be str or TextWithEntities
         title = target_folder.title
@@ -4212,11 +4298,13 @@ async def _main() -> None:
     try:
         # Start the Telethon client non-interactively
         print("Starting Telegram client...")
-        await client.start()
+        await start_client()
 
         print("Telegram client started. Running MCP server...")
         # Use the asynchronous entrypoint instead of mcp.run()
         await mcp.run_stdio_async()
+    except KeyboardInterrupt:
+        print("Interrupted. Shutting down...")
     except Exception as e:
         print(f"Error starting client: {e}", file=sys.stderr)
         if isinstance(e, sqlite3.OperationalError) and "database is locked" in str(e):
@@ -4225,11 +4313,19 @@ async def _main() -> None:
                 file=sys.stderr,
             )
         sys.exit(1)
+    finally:
+        try:
+            await client.disconnect()
+        except Exception as exc:
+            logger.warning("Failed to disconnect Telegram client: %s", exc)
 
 
 def main() -> None:
     nest_asyncio.apply()
-    asyncio.run(_main())
+    try:
+        asyncio.run(_main())
+    except KeyboardInterrupt:
+        print("Interrupted. Exiting.")
 
 
 if __name__ == "__main__":
