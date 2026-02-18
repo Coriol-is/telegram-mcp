@@ -146,7 +146,7 @@ async def call_tool(tool_name: str, payload: ToolCallRequest) -> Dict[str, Any]:
 
 
 def main() -> None:
-    host = os.getenv("TELEGRAM_MCP_API_HOST", "0.0.0.0")
+    host = os.getenv("TELEGRAM_MCP_API_HOST", "0.0.0.0")  # nosec B104 - intentional for API server
     port = int(os.getenv("TELEGRAM_MCP_API_PORT", "8000"))
     uvicorn.run("telegram_mcp_server.api:app", host=host, port=port, log_level="info")
 

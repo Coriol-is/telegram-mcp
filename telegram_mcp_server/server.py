@@ -3,6 +3,7 @@ import json
 import mimetypes
 import os
 import re
+import secrets
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
@@ -2561,9 +2562,9 @@ async def join_chat_by_link(link: str) -> str:
                 # If we got chat info, we're already a member
                 chat_title = getattr(invite_info.chat, "title", UNKNOWN_CHAT_TITLE)
                 return f"You are already a member of this chat: {chat_title}"
-        except Exception:
+        except Exception as e:
             # This often fails if not a member - just continue
-            pass
+            logger.debug(f"Failed to check invite status: {e}")
 
         # Join the chat using the hash
         result = await client(functions.messages.ImportChatInviteRequest(hash=hash_part))
@@ -3467,12 +3468,11 @@ async def create_poll(
                 return "Invalid close_date format. Use YYYY-MM-DD HH:MM:SS format."
 
         # Create the poll using InputMediaPoll with SendMediaRequest
-        import random
-
         from telethon.tl.types import InputMediaPoll, Poll, PollAnswer, TextWithEntities
 
         poll = Poll(
-            id=random.randint(0, 2**63 - 1),
+            id=int.from_bytes(secrets.token_bytes(8), "big")
+            & ((1 << 63) - 1),  # nosec B311 - secure random ID
             question=TextWithEntities(text=question, entities=[]),
             answers=[
                 PollAnswer(text=TextWithEntities(text=option, entities=[]), option=bytes([i]))
@@ -3489,7 +3489,8 @@ async def create_poll(
                 peer=entity,
                 media=InputMediaPoll(poll=poll),
                 message="",
-                random_id=random.randint(0, 2**63 - 1),
+                random_id=int.from_bytes(secrets.token_bytes(8), "big")
+                & ((1 << 63) - 1),  # nosec B311 - secure random ID
             )
         )
 
