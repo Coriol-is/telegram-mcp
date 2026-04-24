@@ -25,6 +25,7 @@ from telethon.tl.types import (
     ChatAdminRights,
     ChatBannedRights,
     DialogFilter,
+    DialogFilterChatlist,
     DialogFilterDefault,
     InputChatPhotoEmpty,
     InputChatUploadedPhoto,
@@ -3805,15 +3806,17 @@ async def list_folders() -> str:
             if isinstance(f, DialogFilterDefault):
                 continue
 
-            if isinstance(f, DialogFilter):
+            if isinstance(f, (DialogFilter, DialogFilterChatlist)):
                 # Handle title which can be str or TextWithEntities
                 title = f.title
                 if isinstance(title, TextWithEntities):
                     title = title.text
+                is_shared = isinstance(f, DialogFilterChatlist)
                 folder_data = {
                     "id": f.id,
                     "title": title,
                     "emoticon": getattr(f, "emoticon", None),
+                    "shared": is_shared,
                     "contacts": getattr(f, "contacts", False),
                     "non_contacts": getattr(f, "non_contacts", False),
                     "groups": getattr(f, "groups", False),
@@ -3866,7 +3869,7 @@ async def get_folder(folder_id: int) -> str:
 
         target_folder = None
         for f in result.filters:
-            if isinstance(f, DialogFilter) and f.id == folder_id:
+            if isinstance(f, (DialogFilter, DialogFilterChatlist)) and f.id == folder_id:
                 target_folder = f
                 break
 
@@ -3874,6 +3877,8 @@ async def get_folder(folder_id: int) -> str:
             return (
                 f"Folder with ID {folder_id} not found. Use list_folders to see available folders."
             )
+
+        is_shared = isinstance(target_folder, DialogFilterChatlist)
 
         # Resolve included peers to readable names
         included_chats = []
@@ -3899,6 +3904,7 @@ async def get_folder(folder_id: int) -> str:
             "id": target_folder.id,
             "title": title,
             "emoticon": getattr(target_folder, "emoticon", None),
+            "shared": is_shared,
             "filters": {
                 "contacts": getattr(target_folder, "contacts", False),
                 "non_contacts": getattr(target_folder, "non_contacts", False),
@@ -3961,7 +3967,7 @@ async def create_folder(
         existing_ids = set()
         folder_count = 0
         for f in result.filters:
-            if isinstance(f, DialogFilter):
+            if isinstance(f, (DialogFilter, DialogFilterChatlist)):
                 existing_ids.add(f.id)
                 folder_count += 1
 
@@ -4043,7 +4049,7 @@ async def add_chat_to_folder(
 
         target_folder = None
         for f in result.filters:
-            if isinstance(f, DialogFilter) and f.id == folder_id:
+            if isinstance(f, (DialogFilter, DialogFilterChatlist)) and f.id == folder_id:
                 target_folder = f
                 break
 
@@ -4133,7 +4139,7 @@ async def remove_chat_from_folder(folder_id: int, chat_id: Union[int, str]) -> s
 
         target_folder = None
         for f in result.filters:
-            if isinstance(f, DialogFilter) and f.id == folder_id:
+            if isinstance(f, (DialogFilter, DialogFilterChatlist)) and f.id == folder_id:
                 target_folder = f
                 break
 
@@ -4232,7 +4238,7 @@ async def delete_folder(folder_id: int) -> str:
         folder_exists = False
         folder_title = None
         for f in result.filters:
-            if isinstance(f, DialogFilter) and f.id == folder_id:
+            if isinstance(f, (DialogFilter, DialogFilterChatlist)) and f.id == folder_id:
                 folder_exists = True
                 # Handle title which can be str or TextWithEntities
                 title = f.title
@@ -4271,7 +4277,7 @@ async def reorder_folders(folder_ids: List[int]) -> str:
 
         existing_ids = set()
         for f in result.filters:
-            if isinstance(f, DialogFilter):
+            if isinstance(f, (DialogFilter, DialogFilterChatlist)):
                 existing_ids.add(f.id)
 
         # Validate all provided IDs exist
